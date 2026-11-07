@@ -261,6 +261,7 @@ footer{padding-bottom:max(28px,env(safe-area-inset-bottom))}
 <div class="modal-backdrop" id="purchaseModal" role="dialog" aria-modal="true"><div class="modal mini"><button class="close" aria-label="Закрыть" data-close="purchaseModal">×</button><div id="purchaseBody"></div></div></div>
 <div class="toast" id="toast"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
 /* ===== helpers ===== */
 const $=id=>document.getElementById(id);
@@ -296,9 +297,9 @@ function openDB(){return _db||(_db=new Promise((res,rej)=>{const r=indexedDB.ope
 async function tx(mode,fn){const db=await openDB();return new Promise((res,rej)=>{const t=db.transaction('games',mode);const out=fn(t.objectStore('games'));t.oncomplete=()=>res(out&&out.result!==undefined?out.result:undefined);t.onerror=()=>rej(t.error);t.onabort=()=>rej(t.error)})}
 let idbOk=true;const memGames=[];
 function idbFail(){idbOk=false;showStorageWarn()}
-const dbAll=async()=>{if(idbOk){try{return await tx('readonly',s=>s.getAll())}catch(e){idbFail()}}return [...memGames]};
-const dbPut=async g=>{if(idbOk){try{return await tx('readwrite',s=>s.put(g))}catch(e){idbFail()}}const i=memGames.findIndex(x=>x.id===g.id);if(i>=0)memGames[i]=g;else memGames.push(g)};
-const dbDel=async id=>{if(idbOk){try{return await tx('readwrite',s=>s.delete(id))}catch(e){idbFail()}}const i=memGames.findIndex(x=>x.id===id);if(i>=0)memGames.splice(i,1)};
+const dbAllLocal=async()=>{if(idbOk){try{return await tx('readonly',s=>s.getAll())}catch(e){idbFail()}}return [...memGames]};
+const dbPutLocal=async g=>{if(idbOk){try{return await tx('readwrite',s=>s.put(g))}catch(e){idbFail()}}const i=memGames.findIndex(x=>x.id===g.id);if(i>=0)memGames[i]=g;else memGames.push(g)};
+const dbDelLocal=async id=>{if(idbOk){try{return await tx('readwrite',s=>s.delete(id))}catch(e){idbFail()}}const i=memGames.findIndex(x=>x.id===id);if(i>=0)memGames.splice(i,1)};
 
 /* ===== auth (localStorage) ===== */
 async function hashPw(pw,salt){
@@ -306,14 +307,17 @@ async function hashPw(pw,salt){
   if(crypto.subtle){const b=await crypto.subtle.digest('SHA-256',data);return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
   let h=5381;for(const c of data)h=((h<<5)+h+c)>>>0;return 'x'+h;
 }
-const users=()=>LS.get('pg_users',[]);
-const me=()=>{const id=LS.get('pg_session',null);return users().find(u=>u.id===id)||null};
+const SB_URL='https://smallqspchtqvznbrmeq.supabase.co',SB_KEY='sb_publishable_bFx3LE-1Mau_DxP_blNBRQ_Xc-Dn1r0';
+let sb=null,REMOTE=false,PROFILES=[],SESSION_ID=null;
+try{sb=window.supabase.createClient(SB_URL,SB_KEY)}catch(e){console.warn('supabase init',e)}
+const users=()=>REMOTE?PROFILES:LS.get('pg_users',[]);
+const me=()=>{const id=REMOTE?SESSION_ID:LS.get('pg_session',null);return users().find(u=>u.id===id)||null};
 const ADMIN_NICK='ibragim';
-const isAdminUser=u=>!!u&&String(u.nick||'').toLowerCase()===ADMIN_NICK;
+const isAdminUser=u=>!!u&&(REMOTE?u.role==='admin':String(u.nick||'').toLowerCase()===ADMIN_NICK);
 const isAdmin=()=>isAdminUser(me());
 function rid(){return (crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random().toString(16).slice(2))}
 
-async function register(nick,email,pw){
+async function registerLocal(nick,email,pw){
   const list=users();
   if(list.some(u=>u.email===email))throw new Error('Этот email уже зарегистрирован. Войди в аккаунт.');
   if(list.some(u=>u.nick.toLowerCase()===nick.toLowerCase()))throw new Error('Этот ник уже занят.');
@@ -321,12 +325,67 @@ async function register(nick,email,pw){
   const u={id:rid(),nick,email,salt,hash:await hashPw(pw,salt),role:isAdminUser({nick})?'admin':'user',created:Date.now()};
   list.push(u);LS.set('pg_users',list);LS.set('pg_session',u.id);return u;
 }
-async function login(email,pw){
+async function loginLocal(email,pw){
   const u=users().find(x=>x.email===email);
   if(!u||u.hash!==await hashPw(pw,u.salt))throw new Error('Неверный email или пароль.');
   LS.set('pg_session',u.id);return u;
 }
-function logout(){LS.del('pg_session');chatWith=null;['gameModal','profileModal','msgModal','cabModal','walletModal','libraryModal','purchaseModal'].forEach(closeM);renderAccount();renderGames();toast('Ты вышел из аккаунта')}
+
+/* ===== Supabase (общая база) ===== */
+const sbMsg=e=>{const m=String(e&&e.message||e);
+  if(/already registered|already been registered/i.test(m))return 'Этот email уже зарегистрирован. Войди в аккаунт.';
+  if(/Database error saving new user|profiles_nick/i.test(m))return 'Этот ник уже занят.';
+  if(/Invalid login/i.test(m))return 'Неверный email или пароль.';
+  if(/Password should be/i.test(m))return 'Пароль слишком короткий (минимум 6 символов).';
+  return m};
+async function syncRemote(){
+  const{data:{session}}=await sb.auth.getSession();
+  SESSION_ID=session?session.user.id:null;
+  const{data,error}=await sb.from('profiles').select('*');if(error)throw error;
+  const bal=LS.get('pg_localbal',{});
+  PROFILES=data.map(x=>({id:x.id,nick:x.nick,avatar:x.avatar,bio:x.bio,role:x.role,created:Date.parse(x.created_at),
+    email:session&&x.id===SESSION_ID?session.user.email:undefined,balance:bal[x.id]||0}));
+}
+async function initRemote(){
+  if(!sb)return;
+  try{await syncRemote();const t=await sb.from('games').select('id',{count:'exact',head:true});if(t.error)throw t.error;REMOTE=true}
+  catch(e){REMOTE=false;console.warn('remote off',e);toast('Общая база недоступна — сайт работает в локальном режиме')}
+}
+async function register(nick,email,pw){
+  if(!REMOTE)return registerLocal(nick,email,pw);
+  const{data,error}=await sb.auth.signUp({email,password:pw,options:{data:{nick}}});
+  if(error)throw new Error(sbMsg(error));
+  if(!data.session)throw new Error('Мы отправили письмо для подтверждения на '+email+'. Подтверди почту и войди.');
+  await syncRemote();await loadGames();return me();
+}
+async function login(email,pw){
+  if(!REMOTE)return loginLocal(email,pw);
+  const{error}=await sb.auth.signInWithPassword({email,password:pw});
+  if(error)throw new Error(sbMsg(error));
+  await syncRemote();await loadGames();return me();
+}
+const coverSrc=g=>g.coverUrl||URL.createObjectURL(g.coverBlob);
+const gFromRow=r=>({id:r.id,title:r.title,desc:r.description,category:r.category,price:Number(r.price),authorId:r.author_id,
+  author:(PROFILES.find(p=>p.id===r.author_id)||{}).nick||'—',status:r.status,created:Date.parse(r.created_at),
+  downloadUrl:r.download_url||'',telegramUrl:r.telegram_url||'',fileName:r.file_name||'',filePath:r.file_path||'',coverPath:r.cover_path||'',
+  coverUrl:r.cover_path?sb.storage.from('covers').getPublicUrl(r.cover_path).data.publicUrl:''});
+const dbAll=async()=>{if(!REMOTE)return dbAllLocal();
+  const{data,error}=await sb.from('games').select('*').order('created_at',{ascending:false});if(error)throw error;return data.map(gFromRow)};
+const dbPut=async g=>{if(!REMOTE)return dbPutLocal(g);
+  const ex=allGames.find(x=>x.id===g.id);
+  if(ex){if(ex.status!==g.status){const{error}=await sb.rpc('set_game_status',{p_id:g.id,p_status:g.status});if(error)throw error}return}
+  const uid=SESSION_ID;let cp=null,fp=null;
+  if(g.coverBlob){cp=uid+'/'+g.id+'-cover';const{error}=await sb.storage.from('covers').upload(cp,g.coverBlob,{contentType:g.coverBlob.type||'image/jpeg'});if(error)throw error}
+  if(g.fileBlob){fp=uid+'/'+g.id+'-file';const{error}=await sb.storage.from('game-files').upload(fp,g.fileBlob,{contentType:g.fileBlob.type||'application/octet-stream'});if(error)throw error}
+  const{error}=await sb.from('games').insert({id:g.id,author_id:uid,title:g.title,description:g.desc||'',category:g.category,price:g.price||0,
+    cover_path:cp,file_path:fp,file_name:g.fileName||null,download_url:g.downloadUrl||null,telegram_url:g.telegramUrl||null,status:g.status});
+  if(error)throw error};
+const dbDel=async id=>{if(!REMOTE)return dbDelLocal(id);
+  const g=allGames.find(x=>x.id===id);const{error}=await sb.from('games').delete().eq('id',id);if(error)throw error;
+  if(g&&g.filePath)sb.storage.from('game-files').remove([g.filePath]);if(g&&g.coverPath)sb.storage.from('covers').remove([g.coverPath])};
+setInterval(()=>{if(REMOTE&&!document.hidden)syncRemote().then(loadGames).catch(()=>{})},60000);
+
+function logout(){if(REMOTE){sb.auth.signOut();SESSION_ID=null}LS.del('pg_session');chatWith=null;['gameModal','profileModal','msgModal','cabModal','walletModal','libraryModal','purchaseModal'].forEach(closeM);renderAccount();renderGames();toast('Ты вышел из аккаунта')}
 
 function renderAccount(){
   const box=$('account');box.textContent='';const u=me();lastUnread=unreadCount();
@@ -393,7 +452,7 @@ async function loadGames(){allGames=await dbAll();renderGames()}
 function gameCard(g){
   const c=CAT[g.category]||CAT.adventure;
   const cover=el('div',{class:'cover '+c.c+' clickable',onclick:()=>openGame(g.id)});
-  if(g.coverBlob){cover.append(el('img',{src:URL.createObjectURL(g.coverBlob),alt:g.title}))}else cover.textContent=c.i;
+  if(g.coverBlob||g.coverUrl){cover.append(el('img',{src:coverSrc(g),alt:g.title}))}else cover.textContent=c.i;
   const mine=me()&&(me().id===g.authorId||isAdmin());
   const paid=g.price>0;
   const btn=el('button',{class:'download',type:'button',onclick:()=>onDownload(g)},canGet(g)||g.demo&&!paid?'Скачать':'Купить');
@@ -420,10 +479,12 @@ function buildFilters(){
 function fillCats(){const sel=$('gameCat');Object.entries(CAT).forEach(([k,c])=>sel.append(el('option',{value:k},c.i+' '+c.n)))}
 $('search').addEventListener('input',renderGames);
 
-function onDownload(g){
+async function onDownload(g){
   if(g.demo)return toast('Это демонстрационная игра. Реальные игры скачиваются по файлу или ссылке автора.');
   if(!canGet(g)){openGame(g.id);return toast('Чтобы скачать платную игру, сначала купи её')}
   const du=me();if(du&&g.price<=0&&du.id!==g.authorId&&addToLibrary(du.id,g.id,0)){renderAccount();renderGames()}
+  if(REMOTE&&g.filePath){const{data,error}=await sb.storage.from('game-files').createSignedUrl(g.filePath,120,{download:g.fileName||true});
+    if(error){toast('Файл недоступен: '+error.message);return}location.href=data.signedUrl;return}
   if(g.fileBlob){
     const a=el('a',{href:URL.createObjectURL(g.fileBlob),download:g.fileName||g.title});
     document.body.append(a);a.click();a.remove();return;
@@ -562,7 +623,7 @@ function openGame(id){
   current={type:'game',id};
   const c=CAT[g.category]||CAT.adventure,u=me(),body=$('gameBody');body.textContent='';
   const cover=el('div',{class:'cover big '+c.c});
-  if(g.coverBlob)cover.append(el('img',{src:URL.createObjectURL(g.coverBlob),alt:g.title}));else cover.textContent=c.i;
+  if(g.coverBlob||g.coverUrl)cover.append(el('img',{src:coverSrc(g),alt:g.title}));else cover.textContent=c.i;
   const st=gameStats(g.id),mine=u&&(u.id===g.authorId||isAdmin());
   body.append(cover,el('h2',{style:'margin:14px 0 6px'},g.title),
     el('div',{class:'by'},'Автор: ',g.demo?g.author:userLink(g.authorId,g.author),' · '+c.n+' · '+fmtPrice(g.price)),
@@ -607,6 +668,7 @@ function openProfile(uid){
       el('button',{class:'send',type:'button',onclick:()=>{
         const list=users(),i=list.findIndex(x=>x.id===uid);if(i<0)return;
         list[i].avatar=av;list[i].bio=bio.value.trim().slice(0,200);LS.set('pg_users',list);
+        if(REMOTE)sb.from('profiles').update({avatar:list[i].avatar,bio:list[i].bio}).eq('id',uid).then(r=>{if(r.error)toast('Не сохранилось: '+r.error.message)});
         renderAccount();toast('Профиль сохранён');openProfile(uid);
       }},'Сохранить профиль')));
   }else{
@@ -772,7 +834,7 @@ const MAX_BAL=1000000;
 const cents=v=>Math.round(Number(v)*100);
 const eur=c=>(c/100).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2})+' €';
 const balanceOf=u=>(u&&u.balance)||0;
-function changeBalance(uid,delta){const list=users(),i=list.findIndex(x=>x.id===uid);if(i<0)return false;list[i].balance=Math.max(0,(list[i].balance||0)+delta);LS.set('pg_users',list);return true}
+function changeBalance(uid,delta){if(REMOTE){const m=LS.get('pg_localbal',{});m[uid]=Math.max(0,(m[uid]||0)+delta);LS.set('pg_localbal',m);const pu=PROFILES.find(x=>x.id===uid);if(pu)pu.balance=m[uid];return !!pu}const list=users(),i=list.findIndex(x=>x.id===uid);if(i<0)return false;list[i].balance=Math.max(0,(list[i].balance||0)+delta);LS.set('pg_users',list);return true}
 const txs=()=>LS.get('pg_tx',[]);
 function addTx(uid,type,amount,note){const t=txs();t.push({id:rid(),userId:uid,type,amount,note,ts:Date.now()});LS.set('pg_tx',t)}
 const purchases=()=>LS.get('pg_purchases',[]);
@@ -986,7 +1048,7 @@ function openLibrary(){
 
 if(!lsOk)showStorageWarn();
 buildFilters();fillCats();
-renderAccount();loadGames();
+initRemote().finally(()=>{renderAccount();loadGames()});
 </script>
 </body>
 </html>
